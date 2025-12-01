@@ -1,4 +1,5 @@
-# app.py — Modern Google Drive Manager
+# app.py — Modern Google Drive Manager (Updated for Single/Double Click)
+import sys
 import os
 import threading
 from tkinter import filedialog, messagebox
@@ -17,6 +18,15 @@ ctk.set_default_color_theme("blue")
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
+def resource_path(relative_path):
+    """Get the correct path whether running as .py or .exe"""
+    try:
+        # When running as EXE, PyInstaller puts files in a temp folder
+        base_path = sys._MEIPASS
+    except:
+        # When running as .py, use the current folder
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 class ModernDriveApp:
     def __init__(self, root):
         self.root = root
@@ -27,6 +37,7 @@ class ModernDriveApp:
         self.service = None
         self.files = []
         self.selected_file_id = None
+        self.selected_file_name = None
         self.current_folder_id = None
         self.breadcrumb_stack = []
         self.loading = False
@@ -219,15 +230,18 @@ class ModernDriveApp:
         )
 
     def auto_login(self):
+    # ✅ Check for token.json in current working directory (not bundled)
         if os.path.exists("token.json"):
             def _auto():
                 try:
+                    # Load from current folder
                     creds = Credentials.from_authorized_user_file("token.json", SCOPES)
                     if creds.valid:
                         self.service = build("drive", "v3", credentials=creds)
                         self.root.after(0, self.on_login_success)
                     elif creds.expired and creds.refresh_token:
                         creds.refresh(Request())
+                        # Save back to current folder (not resource_path)
                         with open("token.json", "w") as token:
                             token.write(creds.to_json())
                         self.service = build("drive", "v3", credentials=creds)
@@ -240,12 +254,20 @@ class ModernDriveApp:
     def manual_login(self):
         def _login():
             try:
-                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-                creds = flow.run_local_server(port=0)
+                # Get the correct path to credentials.json
+                creds_path = resource_path("credentials.json")
+                
+                # Run OAuth flow using that file
+                flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
+                creds = flow.run_local_server(port=0)  # ← This returns Credentials object
+                
+                # Save token.json (use normal path, not resource_path, for output)
                 with open("token.json", "w") as token:
-                    token.write(creds.to_json())
+                    token.write(creds.to_json())  # ← creds is the Credentials object
+
                 self.service = build("drive", "v3", credentials=creds)
                 self.root.after(0, self.on_login_success)
+                
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Login Failed", str(e)))
 
@@ -334,8 +356,44 @@ class ModernDriveApp:
             )
             btn.pack(side="left", padx=2)
 
+    def on_item_select(self, file_id, file_name, is_folder, card):
+        """Handle single-click selection of any item (file or folder)"""
+        self.selected_file_id = file_id
+        self.selected_file_name = file_name
+
+        # Enable action buttons
+        if is_folder:
+            self.download_btn_sidebar.configure(state="disabled")  # Can't download folders
+        else:
+            self.download_btn_sidebar.configure(state="normal")
+        
+        self.rename_btn_sidebar.configure(state="normal")
+        self.move_btn_sidebar.configure(state="normal")
+
+        # Highlight selected card
+        for widget in self.grid_frame.winfo_children():
+            if hasattr(widget, 'file_id'):
+                is_selected = (widget.file_id == file_id)
+                widget.selected = is_selected
+                if is_selected:
+                    widget.configure(border_color=self.colors["primary"], fg_color=self.colors["bg_hover"])
+                else:
+                    widget.configure(border_color=self.colors["bg_card"], fg_color=self.colors["bg_card"])
+
+    def on_folder_open(self, folder_id, folder_name):
+        """Handle double-click to open folder"""
+        self.breadcrumb_stack.append((folder_id, folder_name))
+        self.go_to_folder(folder_id)
+
     def populate_grid(self):
         self.hide_loading()
+        
+        # Clear selection when loading new folder
+        self.selected_file_id = None
+        self.selected_file_name = None
+        self.download_btn_sidebar.configure(state="disabled")
+        self.rename_btn_sidebar.configure(state="disabled")
+        self.move_btn_sidebar.configure(state="disabled")
         
         for widget in self.grid_frame.winfo_children():
             widget.destroy()
@@ -400,22 +458,32 @@ class ModernDriveApp:
             )
             type_label.pack()
 
-            # Bind events
+            # Store metadata
             card.file_id = f["id"]
             card.file_name = f["name"]
             card.is_folder = is_folder
 
-            if is_folder:
-                card.bind("<Button-1>", lambda e, fid=f["id"], fname=f["name"]: self.on_folder_click(fid, fname))
-                for child in card.winfo_children():
-                    child.bind("<Button-1>", lambda e, fid=f["id"], fname=f["name"]: self.on_folder_click(fid, fname))
-            else:
-                card.bind("<Button-1>", lambda e, fid=f["id"], fname=f["name"]: self.on_file_click(fid, fname, e.widget))
-                for child in card.winfo_children():
-                    child.bind("<Button-1>", lambda e, fid=f["id"], fname=f["name"], c=card: self.on_file_click(fid, fname, c))
+            # === Bindings ===
+            # Single-click: select
+            def make_select(fid, fname, is_dir, c):
+                return lambda e: self.on_item_select(fid, fname, is_dir, c)
 
+            # Double-click: open (folders only)
+            def make_open(fid, fname):
+                return lambda e: self.on_folder_open(fid, fname)
+
+            card.bind("<Button-1>", make_select(f["id"], f["name"], is_folder, card))
+            for child in card.winfo_children():
+                child.bind("<Button-1>", make_select(f["id"], f["name"], is_folder, card))
+
+            if is_folder:
+                card.bind("<Double-Button-1>", make_open(f["id"], f["name"]))
+                for child in card.winfo_children():
+                    child.bind("<Double-Button-1>", make_open(f["id"], f["name"]))
+
+            # Hover effects
             card.bind("<Enter>", lambda e, w=card: w.configure(border_color=self.colors["primary"]))
-            card.bind("<Leave>", lambda e, w=card: w.configure(border_color=self.colors["bg_card"]) if not hasattr(w, 'selected') else None)
+            card.bind("<Leave>", lambda e, w=card: w.configure(border_color=self.colors["bg_card"]) if not getattr(w, 'selected', False) else None)
 
         for i in range(columns):
             self.grid_frame.grid_columnconfigure(i, weight=1)
@@ -423,200 +491,10 @@ class ModernDriveApp:
     def navigate_to_breadcrumb(self, folder_id, index=None):
         """Navigate to a folder from breadcrumb, resetting the path"""
         if folder_id is None:
-            # Going to root, clear all breadcrumbs
             self.breadcrumb_stack = []
         elif index is not None:
-            # Going to a specific breadcrumb, keep only items up to that index
             self.breadcrumb_stack = self.breadcrumb_stack[:index + 1]
-        
         self.go_to_folder(folder_id)
-
-    def show_context_menu_at_button_delayed(self, file_id, file_name, is_folder):
-        """Show context menu - delayed to get proper widget position"""
-        # Store selected item info
-        self.selected_file_id = file_id
-        self.selected_file_name = file_name
-        
-        # Find the button widget by searching through grid
-        button_widget = None
-        for widget in self.grid_frame.winfo_children():
-            if hasattr(widget, 'file_id') and widget.file_id == file_id:
-                if hasattr(widget, 'menu_btn'):
-                    button_widget = widget.menu_btn
-                    break
-        
-        if button_widget:
-            # Get button position
-            x = button_widget.winfo_rootx()
-            y = button_widget.winfo_rooty() + button_widget.winfo_height()
-            
-            print(f"Menu button clicked for: {file_name} at {x}, {y}")  # Debug
-            
-            # Create context menu using tkinter Menu
-            import tkinter as tk
-            
-            menu = tk.Menu(self.root, tearoff=0, 
-                          bg="#1a1a1a", 
-                          fg="#ffffff", 
-                          activebackground="#2d2d2d", 
-                          activeforeground="#ffffff",
-                          borderwidth=2, 
-                          relief="solid",
-                          font=(self.ui_font, 11))
-            
-            if is_folder:
-                # Folder options
-                menu.add_command(label="📂 Open", 
-                               command=lambda: self.on_folder_click(file_id, file_name))
-            else:
-                # File options
-                menu.add_command(label="⬇️ Download", 
-                               command=self.download_file)
-            
-            # Common options
-            menu.add_separator()
-            menu.add_command(label="✏️ Rename", 
-                            command=self.rename_file)
-            menu.add_command(label="📁 Move", 
-                            command=self.move_file)
-            
-            menu.add_separator()
-            menu.add_command(label="🗑️ Delete", 
-                            command=lambda: self.delete_file(file_id, file_name),
-                            foreground="#ef4444")
-            
-            try:
-                menu.tk_popup(x, y)
-            finally:
-                menu.grab_release()
-
-    def show_context_menu_at_button(self, button_widget, file_id, file_name, is_folder):
-        """Show context menu below the button"""
-        print(f"Menu button clicked for: {file_name}")  # Debug
-        
-        # Store selected item info
-        self.selected_file_id = file_id
-        self.selected_file_name = file_name
-        
-        # Get button position
-        x = button_widget.winfo_rootx()
-        y = button_widget.winfo_rooty() + button_widget.winfo_height()
-        
-        # Create context menu using tkinter Menu
-        import tkinter as tk
-        
-        menu = tk.Menu(self.root, tearoff=0, 
-                      bg="#1a1a1a", 
-                      fg="#ffffff", 
-                      activebackground="#2d2d2d", 
-                      activeforeground="#ffffff",
-                      borderwidth=2, 
-                      relief="solid",
-                      font=(self.ui_font, 11))
-        
-        if is_folder:
-            # Folder options
-            menu.add_command(label="📂 Open", 
-                           command=lambda: self.on_folder_click(file_id, file_name))
-        else:
-            # File options
-            menu.add_command(label="⬇️ Download", 
-                           command=self.download_file)
-        
-        # Common options
-        menu.add_separator()
-        menu.add_command(label="✏️ Rename", 
-                        command=self.rename_file)
-        menu.add_command(label="📁 Move", 
-                        command=self.move_file)
-        
-        menu.add_separator()
-        menu.add_command(label="🗑️ Delete", 
-                        command=lambda: self.delete_file(file_id, file_name),
-                        foreground="#ef4444")
-        
-        try:
-            print(f"Showing menu at: {x}, {y}")  # Debug
-            menu.tk_popup(x, y)
-        finally:
-            menu.grab_release()
-
-    def show_context_menu(self, event, file_id, file_name, is_folder):
-        """Show context menu on right click (kept for compatibility but may not work on Windows)"""
-        print(f"Context menu triggered for: {file_name}, is_folder: {is_folder}")  # Debug
-        
-        # Store selected item info
-        self.selected_file_id = file_id
-        self.selected_file_name = file_name
-        
-        # Create context menu using tkinter Menu for better compatibility
-        import tkinter as tk
-        
-        menu = tk.Menu(self.root, tearoff=0, 
-                      bg="#1a1a1a", 
-                      fg="#ffffff", 
-                      activebackground="#2d2d2d", 
-                      activeforeground="#ffffff",
-                      borderwidth=2, 
-                      relief="solid",
-                      font=(self.ui_font, 11))
-        
-        if is_folder:
-            # Folder options
-            menu.add_command(label="📂 Open", 
-                           command=lambda: self.on_folder_click(file_id, file_name))
-        else:
-            # File options
-            menu.add_command(label="⬇️ Download", 
-                           command=self.download_file)
-        
-        # Common options
-        menu.add_separator()
-        menu.add_command(label="✏️ Rename", 
-                        command=self.rename_file)
-        menu.add_command(label="📁 Move", 
-                        command=self.move_file)
-        
-        menu.add_separator()
-        menu.add_command(label="🗑️ Delete", 
-                        command=lambda: self.delete_file(file_id, file_name),
-                        foreground="#ef4444")
-        
-        try:
-            print(f"Showing menu at: {event.x_root}, {event.y_root}")  # Debug
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
-        
-        return "break"  # Prevent event propagation
-
-    def on_folder_click(self, folder_id, folder_name):
-        """Navigate into a folder"""
-        # Add folder to breadcrumb stack
-        self.breadcrumb_stack.append((folder_id, folder_name))
-        self.go_to_folder(folder_id)
-
-    def on_file_click(self, file_id, file_name, card):
-        self.selected_file_id = file_id
-        self.selected_file_name = file_name
-        self.download_btn_sidebar.configure(state="normal")
-        self.rename_btn_sidebar.configure(state="normal")
-        self.move_btn_sidebar.configure(state="normal")
-
-        # Highlight
-        for widget in self.grid_frame.winfo_children():
-            if hasattr(widget, 'file_id'):
-                if widget.file_id == file_id:
-                    widget.configure(border_color=self.colors["primary"], fg_color=self.colors["bg_hover"])
-                    widget.selected = True
-                else:
-                    widget.configure(border_color=self.colors["bg_card"], fg_color=self.colors["bg_card"])
-                    widget.selected = False
-
-    def get_current_folder_name(self):
-        if self.breadcrumb_stack:
-            return self.breadcrumb_stack[-1][1]
-        return "Root"
 
     def download_file(self):
         if not self.selected_file_id:
@@ -626,7 +504,6 @@ class ModernDriveApp:
         if not save_path:
             return
 
-        # Show progress bar
         self.progress_frame.pack(side="bottom", pady=(0, 20), padx=20, fill="x", before=self.status_frame)
         self.progress_bar.set(0)
         self.progress_text.configure(text="0%")
@@ -634,35 +511,26 @@ class ModernDriveApp:
         
         def _download():
             try:
-                # Get file metadata for size
                 file_metadata = self.service.files().get(
                     fileId=self.selected_file_id, 
                     fields='size'
                 ).execute()
-                
                 file_size = int(file_metadata.get('size', 0))
-                
                 request = self.service.files().get_media(fileId=self.selected_file_id)
                 fh = BytesIO()
                 downloader = MediaIoBaseDownload(fh, request)
-                
                 done = False
                 while not done:
                     status, done = downloader.next_chunk()
                     if status:
                         progress = status.progress()
                         self.root.after(0, lambda p=progress: self.update_progress(p))
-                
-                # Save file
                 with open(save_path, "wb") as f:
                     fh.seek(0)
                     f.write(fh.read())
-                
-                # Complete
                 self.root.after(0, lambda: self.update_progress(1.0))
                 self.root.after(500, lambda: self.hide_progress())
                 self.root.after(500, lambda: messagebox.showinfo("Success", f"✅ Downloaded:\n{save_path}"))
-                
             except Exception as e:
                 self.root.after(0, lambda: self.hide_progress())
                 self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
@@ -670,27 +538,22 @@ class ModernDriveApp:
         threading.Thread(target=_download, daemon=True).start()
 
     def update_progress(self, value):
-        """Update progress bar value"""
         self.progress_bar.set(value)
         percentage = int(value * 100)
         self.progress_text.configure(text=f"{percentage}%")
     
     def hide_progress(self):
-        """Hide progress bar"""
         self.progress_frame.pack_forget()
 
     def rename_file(self):
-        """Rename the selected file"""
         if not self.selected_file_id:
             return
 
-        # Create rename dialog
         dialog = ctk.CTkInputDialog(
             text=f"Enter new name for:\n{self.selected_file_name}",
             title="Rename File"
         )
         new_name = dialog.get_input()
-
         if not new_name or new_name == self.selected_file_name:
             return
 
@@ -700,7 +563,6 @@ class ModernDriveApp:
                     fileId=self.selected_file_id,
                     body={'name': new_name}
                 ).execute()
-
                 self.root.after(0, lambda: messagebox.showinfo("Success", f"✅ Renamed to:\n{new_name}"))
                 self.root.after(0, lambda: self.go_to_folder(self.current_folder_id))
             except Exception as e:
@@ -709,22 +571,16 @@ class ModernDriveApp:
         threading.Thread(target=_rename, daemon=True).start()
 
     def move_file(self):
-        """Move the selected file to another folder"""
         if not self.selected_file_id:
             return
-
-        # Create folder selection dialog
         self.show_folder_selector()
 
     def show_folder_selector(self):
-        """Show a dialog to select destination folder with hierarchical tree view"""
-        # Create new window
         selector_window = ctk.CTkToplevel(self.root)
         selector_window.title("Move to Folder")
         selector_window.geometry("600x700")
         selector_window.grab_set()
 
-        # Title with current file info
         title_label = ctk.CTkLabel(
             selector_window,
             text=f"Move: {self.selected_file_name[:40]}...",
@@ -732,7 +588,6 @@ class ModernDriveApp:
         )
         title_label.pack(pady=20)
 
-        # Current location indicator
         current_location = ctk.CTkLabel(
             selector_window,
             text="Select destination folder:",
@@ -741,25 +596,16 @@ class ModernDriveApp:
         )
         current_location.pack(pady=(0, 10))
 
-        # Navigation frame (breadcrumb for folder selector)
         nav_frame = ctk.CTkFrame(selector_window, fg_color=self.colors["bg_card"], height=50)
         nav_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
-        # Folder tree frame
-        tree_frame = ctk.CTkScrollableFrame(
-            selector_window,
-            fg_color="transparent"
-        )
+        tree_frame = ctk.CTkScrollableFrame(selector_window, fg_color="transparent")
         tree_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        # Store current navigation state
         nav_state = {"current_folder": None, "breadcrumb": []}
 
         def update_nav_breadcrumb():
-            """Update navigation breadcrumb in selector"""
             for widget in nav_frame.winfo_children():
                 widget.destroy()
-
             home_btn = ctk.CTkButton(
                 nav_frame,
                 text="🏠 My Drive",
@@ -772,13 +618,7 @@ class ModernDriveApp:
             home_btn.pack(side="left", padx=5, pady=10)
 
             for folder_id, folder_name in nav_state["breadcrumb"]:
-                ctk.CTkLabel(
-                    nav_frame,
-                    text="›",
-                    text_color=self.colors["text_secondary"],
-                    font=ctk.CTkFont(size=14)
-                ).pack(side="left", padx=3)
-
+                ctk.CTkLabel(nav_frame, text="›", text_color=self.colors["text_secondary"], font=ctk.CTkFont(size=14)).pack(side="left", padx=3)
                 btn = ctk.CTkButton(
                     nav_frame,
                     text=folder_name[:15] + "..." if len(folder_name) > 15 else folder_name,
@@ -791,45 +631,24 @@ class ModernDriveApp:
                 btn.pack(side="left", padx=3)
 
         def load_folder_contents(folder_id):
-            """Load folders in the current directory"""
-            # Clear tree
             for widget in tree_frame.winfo_children():
                 widget.destroy()
 
-            loading = ctk.CTkLabel(
-                tree_frame,
-                text="Loading folders...",
-                font=ctk.CTkFont(family=self.ui_font, size=13),
-                text_color=self.colors["text_secondary"]
-            )
+            loading = ctk.CTkLabel(tree_frame, text="Loading folders...", font=ctk.CTkFont(family=self.ui_font, size=13), text_color=self.colors["text_secondary"])
             loading.pack(pady=20)
 
             def _load():
                 try:
-                    # Build query
-                    if folder_id is None:
-                        query = "mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false"
-                    else:
-                        query = f"mimeType='application/vnd.google-apps.folder' and '{folder_id}' in parents and trashed=false"
-
-                    result = self.service.files().list(
-                        q=query,
-                        pageSize=100,
-                        fields="files(id, name)",
-                        orderBy="name"
-                    ).execute()
-
+                    query = "mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false" if folder_id is None else f"mimeType='application/vnd.google-apps.folder' and '{folder_id}' in parents and trashed=false"
+                    result = self.service.files().list(q=query, pageSize=100, fields="files(id, name)", orderBy="name").execute()
                     folders = result.get("files", [])
                     nav_state["current_folder"] = folder_id
 
                     def update_ui():
                         loading.destroy()
                         update_nav_breadcrumb()
-
-                        # "Move here" button for current folder
                         move_here_frame = ctk.CTkFrame(tree_frame, fg_color=self.colors["bg_card"])
                         move_here_frame.pack(fill="x", pady=(0, 15))
-
                         move_here_btn = ctk.CTkButton(
                             move_here_frame,
                             text="📍 Move Here",
@@ -841,20 +660,11 @@ class ModernDriveApp:
                         )
                         move_here_btn.pack(fill="x", padx=10, pady=10)
 
-                        # Show subfolders
                         if folders:
-                            ctk.CTkLabel(
-                                tree_frame,
-                                text="Folders:",
-                                font=ctk.CTkFont(family=self.ui_font, size=12, weight="bold"),
-                                text_color=self.colors["text_secondary"]
-                            ).pack(anchor="w", pady=(10, 5))
-
+                            ctk.CTkLabel(tree_frame, text="Folders:", font=ctk.CTkFont(family=self.ui_font, size=12, weight="bold"), text_color=self.colors["text_secondary"]).pack(anchor="w", pady=(10, 5))
                             for folder in folders:
                                 folder_frame = ctk.CTkFrame(tree_frame, fg_color=self.colors["bg_card"])
                                 folder_frame.pack(fill="x", pady=3)
-
-                                # Open folder button (navigate into it)
                                 open_btn = ctk.CTkButton(
                                     folder_frame,
                                     text=f"📁 {folder['name']}",
@@ -866,39 +676,22 @@ class ModernDriveApp:
                                     font=ctk.CTkFont(family=self.ui_font, size=13)
                                 )
                                 open_btn.pack(side="left", fill="x", expand=True, padx=5, pady=5)
-
-                                # Arrow indicator
-                                ctk.CTkLabel(
-                                    folder_frame,
-                                    text="›",
-                                    text_color=self.colors["text_secondary"],
-                                    font=ctk.CTkFont(size=18)
-                                ).pack(side="right", padx=10)
-
+                                ctk.CTkLabel(folder_frame, text="›", text_color=self.colors["text_secondary"], font=ctk.CTkFont(size=18)).pack(side="right", padx=10)
                         else:
-                            ctk.CTkLabel(
-                                tree_frame,
-                                text="No subfolders",
-                                font=ctk.CTkFont(family=self.ui_font, size=12),
-                                text_color=self.colors["text_secondary"]
-                            ).pack(pady=20)
+                            ctk.CTkLabel(tree_frame, text="No subfolders", font=ctk.CTkFont(family=self.ui_font, size=12), text_color=self.colors["text_secondary"]).pack(pady=20)
 
                     selector_window.after(0, update_ui)
-
                 except Exception as e:
                     selector_window.after(0, lambda: loading.configure(text=f"Error: {e}"))
 
             threading.Thread(target=_load, daemon=True).start()
 
         def navigate_into_folder(folder_id, folder_name):
-            """Navigate into a subfolder"""
             nav_state["breadcrumb"].append((folder_id, folder_name))
             load_folder_contents(folder_id)
 
-        # Initial load (root)
         load_folder_contents(None)
 
-        # Cancel button
         cancel_btn = ctk.CTkButton(
             selector_window,
             text="Cancel",
@@ -911,59 +704,35 @@ class ModernDriveApp:
         cancel_btn.pack(pady=(0, 20), padx=20, fill="x")
 
     def execute_move(self, destination_folder_id, dialog_window):
-        """Execute the move operation"""
         dialog_window.destroy()
-
         def _move():
             try:
-                # Get current parents
-                file = self.service.files().get(
-                    fileId=self.selected_file_id,
-                    fields='parents'
-                ).execute()
-
+                file = self.service.files().get(fileId=self.selected_file_id, fields='parents').execute()
                 previous_parents = ",".join(file.get('parents', []))
-
-                # Move file
                 self.service.files().update(
                     fileId=self.selected_file_id,
                     addParents=destination_folder_id if destination_folder_id else 'root',
                     removeParents=previous_parents,
                     fields='id, parents'
                 ).execute()
-
                 dest_name = "My Drive (Root)" if not destination_folder_id else "selected folder"
                 self.root.after(0, lambda: messagebox.showinfo("Success", f"✅ Moved to {dest_name}"))
                 self.root.after(0, lambda: self.go_to_folder(self.current_folder_id))
-
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to move file:\n{e}"))
-
         threading.Thread(target=_move, daemon=True).start()
 
     def delete_file(self, file_id, file_name):
-        """Delete (trash) a file or folder"""
-        # Confirm deletion
-        confirm = messagebox.askyesno(
-            "Confirm Delete",
-            f"Move to trash:\n{file_name}\n\nAre you sure?"
-        )
-        
+        confirm = messagebox.askyesno("Confirm Delete", f"Move to trash:\n{file_name}\n\nAre you sure?")
         if not confirm:
             return
-        
         def _delete():
             try:
-                self.service.files().update(
-                    fileId=file_id,
-                    body={'trashed': True}
-                ).execute()
-                
+                self.service.files().update(fileId=file_id, body={'trashed': True}).execute()
                 self.root.after(0, lambda: messagebox.showinfo("Success", f"✅ Moved to trash:\n{file_name}"))
                 self.root.after(0, lambda: self.go_to_folder(self.current_folder_id))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to delete:\n{e}"))
-        
         threading.Thread(target=_delete, daemon=True).start()
 
 if __name__ == "__main__":
