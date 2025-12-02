@@ -34,6 +34,12 @@ class ModernDriveApp:
         self.root.geometry("1200x800")
         self.root.minsize(900, 600)
 
+        self.dragging = False
+        self.drag_file_id = None
+        self.drag_file_name = None
+        self.drag_ghost = None
+        self.drop_target_folder_id = None
+
         self.service = None
         self.files = []
         self.selected_file_id = None
@@ -44,16 +50,16 @@ class ModernDriveApp:
 
         # Color scheme - Monochrome Black & White
         self.colors = {
-            "primary": "#ffffff",
-            "primary_hover": "#e5e5e5",
-            "secondary": "#808080",
-            "success": "#ffffff",
+            "primary": "#ffffff",           # Button backgrounds (keep white for clarity)
+            "primary_hover": "#e5e5e5",     # Slightly softer
+            "secondary": "#808080",         # OK as-is for hover states
+            "success": "#ffffff",           # Keep for consistency
             "danger": "#ffffff",
-            "bg_dark": "#000000",
-            "bg_card": "#1a1a1a",
-            "bg_hover": "#2d2d2d",
-            "text_primary": "#ffffff",
-            "text_secondary": "#a0a0a0"
+            "bg_dark": "#000000",           # True black (or consider #0d0d0d for OLED)
+            "bg_card": "#1a1a1a",           # Dark card background
+            "bg_hover": "#2d2d2d",          # Hover states
+            "text_primary": "#e8e8e8",      # ✅ SOFT WHITE — less harsh than #ffffff
+            "text_secondary": "#b8b8b8",    # ✅ LIGHT GRAY — more readable than #a0a0a0
         }
         
         # Font family
@@ -339,7 +345,7 @@ class ModernDriveApp:
             ctk.CTkLabel(
                 self.breadcrumb_frame,
                 text="›",
-                text_color=self.colors["text_secondary"],
+                text_color="#909090",  # Slightly darker than secondary text
                 font=ctk.CTkFont(family=self.font_family, size=16)
             ).pack(side="left", padx=5)
 
@@ -734,6 +740,233 @@ class ModernDriveApp:
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to delete:\n{e}"))
         threading.Thread(target=_delete, daemon=True).start()
+
+    # === DRAG-TO-MOVE FUNCTIONALITY ===
+    def start_drag(self, event, file_id, file_name, card):
+        """Start dragging a file card"""
+        if self.dragging or not self.service:
+            return
+            
+        # Only allow dragging files (not folders)
+        is_folder = any(f["id"] == file_id and f["mimeType"] == "application/vnd.google-apps.folder" for f in self.files)
+        if is_folder:
+            return
+            
+        self.dragging = True
+        self.drag_file_id = file_id
+        self.drag_file_name = file_name
+        self.drag_original_card = card
+        self.drop_target_folder_id = None
+        
+        # Store original card position and appearance
+        self.drag_original_fg = card.cget("fg_color")
+        self.drag_original_border = card.cget("border_color")
+        
+        # Make the original card semi-transparent to indicate dragging
+        card.configure(fg_color="#333333", border_color="#555555")
+        
+        # Create a duplicate card that follows the cursor
+        self.create_drag_card(file_id, file_name, card)
+        
+        # Bind mouse events
+        self.root.bind("<B1-Motion>", self.on_drag_motion)
+        self.root.bind("<ButtonRelease-1>", self.on_drag_release)
+        
+        # Disable action buttons during drag
+        self.download_btn_sidebar.configure(state="disabled")
+        self.rename_btn_sidebar.configure(state="disabled")
+        self.move_btn_sidebar.configure(state="disabled")
+
+    def create_drag_card(self, file_id, file_name, original_card):
+        """Create a duplicate card that follows the cursor"""
+        # Create draggable card in main frame (not in scrollable grid)
+        self.drag_card = ctk.CTkFrame(
+            self.main_frame,
+            width=220,
+            height=180,
+            corner_radius=12,
+            fg_color=self.colors["bg_card"],
+            border_width=2,
+            border_color=self.colors["primary"]
+        )
+        
+        # Icon
+        icon_text = "📄"
+        icon_label = ctk.CTkLabel(
+            self.drag_card,
+            text=icon_text,
+            font=ctk.CTkFont(size=56)
+        )
+        icon_label.pack(pady=(20, 10))
+
+        # Name
+        name_display = file_name[:30] + "..." if len(file_name) > 30 else file_name
+        name_label = ctk.CTkLabel(
+            self.drag_card,
+            text=name_display,
+            font=ctk.CTkFont(family=self.ui_font, size=13, weight="bold"),
+            text_color=self.colors["text_primary"],
+            wraplength=200
+        )
+        name_label.pack(pady=(0, 5))
+
+        # Type
+        type_label = ctk.CTkLabel(
+            self.drag_card,
+            text="File (dragging)",
+            font=ctk.CTkFont(family=self.ui_font, size=11),
+            text_color="#4CAF50"
+        )
+        type_label.pack()
+        
+        # Initially hide it (will be positioned on first motion)
+        self.drag_card.place(x=-1000, y=-1000)
+        self.drag_card.lift()  # Ensure it's on top
+
+    def on_drag_motion(self, event):
+        """Move the drag card with cursor and check for drop targets"""
+        if not self.dragging or not hasattr(self, 'drag_card'):
+            return
+            
+        # Position drag card near cursor
+        x = event.x_root - self.root.winfo_rootx() - 110  # Center horizontally
+        y = event.y_root - self.root.winfo_rooty() - 90   # Center vertically
+        
+        # Keep within window bounds
+        x = max(0, min(x, self.root.winfo_width() - 220))
+        y = max(0, min(y, self.root.winfo_height() - 180))
+        
+        self.drag_card.place(x=x, y=y)
+        
+        # Check if over any folder card
+        self.check_drop_targets(event.x_root, event.y_root)
+
+    def check_drop_targets(self, x_root, y_root):
+        """Check if cursor is over any folder card"""
+        current_target = None
+        
+        # Get grid frame coordinates
+        try:
+            grid_x = x_root - self.grid_frame.winfo_rootx()
+            grid_y = y_root - self.grid_frame.winfo_rooty()
+        except:
+            self.clear_drop_targets()
+            return
+            
+        # Check each widget in grid
+        for widget in self.grid_frame.winfo_children():
+            if (hasattr(widget, 'is_folder') and widget.is_folder and 
+                hasattr(widget, 'file_id') and widget.file_id):
+                
+                # Get widget position and size
+                widget_x = widget.winfo_x()
+                widget_y = widget.winfo_y()
+                widget_width = widget.winfo_width() or 220
+                widget_height = widget.winfo_height() or 180
+                
+                # Check if cursor is inside this widget
+                if (widget_x <= grid_x <= widget_x + widget_width and 
+                    widget_y <= grid_y <= widget_y + widget_height):
+                    current_target = widget
+                    break
+        
+        # Update highlighting
+        if current_target and current_target.file_id != self.drop_target_folder_id:
+            self.clear_drop_targets()
+            current_target.configure(border_color="#4CAF50", border_width=3)
+            self.drop_target_folder_id = current_target.file_id
+        elif not current_target and self.drop_target_folder_id:
+            self.clear_drop_targets()
+            self.drop_target_folder_id = None
+
+    def clear_drop_targets(self):
+        """Remove highlight from all folder cards"""
+        for widget in self.grid_frame.winfo_children():
+            if hasattr(widget, 'is_folder') and widget.is_folder:
+                widget.configure(border_color=self.colors["bg_card"], border_width=2)
+
+    def on_drag_release(self, event):
+        """Handle drag release - complete move or cancel"""
+        # Clean up bindings first
+        self.root.unbind("<B1-Motion>")
+        self.root.unbind("<ButtonRelease-1>")
+        
+        # Clean up drag card
+        if hasattr(self, 'drag_card'):
+            self.drag_card.destroy()
+            del self.drag_card
+        
+        # Restore original card appearance
+        if hasattr(self, 'drag_original_card'):
+            self.drag_original_card.configure(
+                fg_color=self.drag_original_fg,
+                border_color=self.drag_original_border
+            )
+        
+        self.clear_drop_targets()
+        
+        # Store values before resetting state
+        file_id = self.drag_file_id
+        target_folder_id = self.drop_target_folder_id
+        
+        # Reset drag state
+        self.dragging = False
+        self.drag_file_id = None
+        self.drag_file_name = None
+        self.drop_target_folder_id = None
+        
+        # Re-enable buttons
+        self.root.after(100, self.update_action_buttons)
+        
+        # Execute move if valid
+        if file_id and target_folder_id:
+            self.execute_drag_move(file_id, target_folder_id)
+
+    def execute_drag_move(self, file_id, destination_folder_id):
+        """Perform the actual file move operation"""
+        def _move():
+            try:
+                # Get current parents
+                file = self.service.files().get(fileId=file_id, fields='parents').execute()
+                previous_parents = ",".join(file.get('parents', []))
+                
+                # Perform the move
+                self.service.files().update(
+                    fileId=file_id,
+                    addParents=destination_folder_id,
+                    removeParents=previous_parents,
+                    fields='id, parents'
+                ).execute()
+                
+                self.root.after(0, lambda: messagebox.showinfo("Success", "✅ File moved successfully"))
+                self.root.after(100, lambda: self.go_to_folder(self.current_folder_id))
+                
+            except Exception as e:
+                error_msg = str(e)
+                if "notFound" in error_msg:
+                    msg = "File or folder not found."
+                elif "permission" in error_msg or "forbidden" in error_msg:
+                    msg = "Permission denied. Cannot move this file."
+                else:
+                    msg = f"Move failed: {error_msg[:100]}"
+                    
+                self.root.after(0, lambda: messagebox.showerror("Move Error", msg))
+        
+        threading.Thread(target=_move, daemon=True).start()
+
+    def update_action_buttons(self):
+        """Update action button states based on current selection"""
+        if self.selected_file_id and not self.dragging:
+            is_folder = any(f["id"] == self.selected_file_id and 
+                           f["mimeType"] == "application/vnd.google-apps.folder" 
+                           for f in self.files)
+            self.download_btn_sidebar.configure(state="disabled" if is_folder else "normal")
+            self.rename_btn_sidebar.configure(state="normal")
+            self.move_btn_sidebar.configure(state="normal")
+        else:
+            self.download_btn_sidebar.configure(state="disabled")
+            self.rename_btn_sidebar.configure(state="disabled")
+            self.move_btn_sidebar.configure(state="disabled")
 
 if __name__ == "__main__":
     root = ctk.CTk()
